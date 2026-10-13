@@ -1,0 +1,40 @@
+name: 手动更新全收益指数数据
+
+# 仅在 GitHub Actions 页面手动点击“Run workflow”时执行。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码库
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 安装计算依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pandas numpy scipy
+
+      - name: 抓取最新点位、ETF 收盘价并同步重算指标
+        run: python -u auto_update_indices.py
+
+      - name: 提交并推送更新后的网页
+        run: |
+          if git diff --quiet -- 指数全收益定投策略.html; then
+            echo "未检测到新的交易日数据、指标或 ETF 价格变化。"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add 指数全收益定投策略.html
+          git commit -m "chore: 手动更新全收益指数点位与 ETF 分位线价格 [skip ci]"
+          git push
