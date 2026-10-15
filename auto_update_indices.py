@@ -16,7 +16,8 @@ INDEX_CONFIG = [
     {"code": "H20269", "name": "红利低波全收益", "source": "CSI"},
     {"code": "H20955", "name": "红利低波100全收益", "source": "CSI"},
     {"code": "932422CNY010", "name": "A500红利低波全收益", "source": "CSI"},
-    {"code": "480081", "name": "价值100全收益", "source": "CNI"}
+    {"code": "480081", "name": "价值100全收益", "source": "CNI"},
+    {"code": "480080", "name": "成长100全收益", "source": "CNI"}
 ]
 
 # 指数 -> 场内 ETF 映射（用于把回撤分位线换算成可交易的价格）
@@ -640,7 +641,14 @@ def update_html(file_path):
             except Exception as e:  # 第三方页面结构变化不应中断整体更新
                 print(f"⚠️ {name} 跟踪对比数据计算失败: {e}")
                 tracking = {}
-            if tracking and tracking != all_data[name].get("tracking"):
+            # 仅比较实质字段，忽略每次运行都会变化的 updated_at，避免每日空跑产生无意义提交
+            previous_tracking = all_data[name].get("tracking") or {}
+            if tracking and (
+                previous_tracking.get("periods") != tracking.get("periods")
+                or previous_tracking.get("years") != tracking.get("years")
+                or previous_tracking.get("inception") != tracking.get("inception")
+                or previous_tracking.get("skipped_periods") != tracking.get("skipped_periods")
+            ):
                 all_data[name]["tracking"] = tracking
                 updated_any = True
                 hit = [p for p in tracking["periods"] if p["diff"] is not None]
