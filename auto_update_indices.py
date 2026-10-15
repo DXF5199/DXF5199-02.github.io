@@ -8,6 +8,7 @@ from bisect import bisect_left
 from datetime import datetime, timedelta
 import time
 import os
+import tempfile
 
 # 配置指数代码映射
 INDEX_CONFIG = [
@@ -30,6 +31,47 @@ ETF_CONFIG = {
     "红利低波100全收益":  {"code": "159307", "market": "sz", "name": "红利低波100ETF博时"},
     "A500红利低波全收益": {"code": "563510", "market": "sh", "name": "A500红利低波ETF易方达"},
     "价值100全收益":      {"code": "159263", "market": "sz", "name": "价值ETF易方达"},
+}
+
+# 指数估值（成分股权重加权）
+# 值为 (价格指数代码, 数据来源)：CSI=中证指数官网、CNI=国证指数官网。
+# 权重来源都是指数公司公开文件（中证为月度、国证为每日），个股行情每日实时，
+# 因此估值数据每个交易日都会刷新。
+VALUATION_CONFIG = {
+    "中证红利全收益": ("000922", "CSI"),
+    "智选高股息全收益": ("932305", "CSI"),
+    "红利低波全收益": ("H30269", "CSI"),
+    "红利低波100全收益": ("930955", "CSI"),
+    "A500红利低波全收益": ("932422", "CSI"),
+    "价值100全收益": ("480081", "CNI"),
+    "成长100全收益": ("480080", "CNI"),
+}
+
+CSI_WEIGHT_URL = (
+    "https://oss-ch.csindex.com.cn/static/html/csindex/public/uploads/"
+    "file/autofile/closeweight/{code}closeweight.xls"
+)
+TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q={symbols}"
+TENCENT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://gu.qq.com/",
+}
+# 腾讯行情字段下标
+TENCENT_FIELD_PE = 39    # 市盈率(TTM)
+TENCENT_FIELD_PB = 46    # 市净率
+TENCENT_FIELD_DY = 64    # 股息率(%)
+TENCENT_FIELD_TIME = 30  # 行情时间戳 YYYYMMDDHHMMSS
+
+# 国证指数官网：样本权重下载接口（完整成分股权重，每日更新）
+CNI_WEIGHT_URL = (
+    "https://www.cnindex.com.cn/sample-detail/download-history?indexcode={code}"
+)
+CNI_HEADERS = {
+    "User-Agent": TENCENT_HEADERS["User-Agent"],
+    "Referer": "https://www.cnindex.com.cn/module/index-detail.html",
 }
 
 # 东方财富 secid 市场前缀：1=沪市，0=深市
@@ -553,6 +595,181 @@ def update_index_calculations(data_obj):
     data_obj["regression_start_date"] = data_obj["dates"][start_idx]
     data_obj["regression_window_years"] = 10
 
+def _normalize_date(raw):
+    """把 20260930 / 2026-09-30 统一成 YYYY-MM-DD。"""
+    text = str(raw).strip()
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    return text
+
+
+def _to_positive_float(raw):
+    """把行情字段转成正浮点数，无效值（空、横杠、负值）返回 None。"""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def fetch_csi_weights(code):
+    """下载并解析中证指数成分股权重，返回 ([(symbol, 名称, 权重%)], 权重日期)。"""
+    response = _request_with_retry(
+        CSI_WEIGHT_URL.format(code=code), headers=TENCENT_HEADERS, timeout=30)
+    tmp_path = os.path.join(tempfile.gettempdir(), f"closeweight_{code}.xls")
+    with open(tmp_path, "wb") as handle:
+        handle.write(response.content)
+
+    frame = pd.read_excel(tmp_path, header=0)
+    columns = list(frame.columns)
+    col_code = next(c for c in columns if "成份券代码" in c)
+    col_exchange = next(c for c in columns if c.startswith("交易所"))
+    col_weight = next(c for c in columns if "权重" in c)
+    col_name = next(c for c in columns if "成份券名称" in c)
+    col_date = next(c for c in columns if "日期" in c)
+
+    rows = []
+    for _, row in frame.iterrows():
+        raw_code = str(row[col_code]).split(".")[0].zfill(6)
+        if "上海" in str(row[col_exchange]):
+            exchange = "sh"
+        elif "深圳" in str(row[col_exchange]):
+            exchange = "sz"
+        else:
+            exchange = "bj"
+        rows.append((exchange + raw_code, str(row[col_name]), float(row[col_weight])))
+    return rows, _normalize_date(str(frame.iloc[0][col_date]))
+
+
+def _guess_market(code):
+    """国证的样本代码不带交易所前缀，按代码段推断所属市场。"""
+    if code[0] in "69":
+        return "sh"
+    if code[0] in "023":
+        return "sz"
+    if code[0] in "48":
+        return "bj"
+    return "sh"
+
+
+def fetch_cni_weights(code):
+    """下载国证指数成分股权重（样本权重 Excel），返回 ([(symbol, 名称, 权重%)], 权重日期)。"""
+    response = _request_with_retry(
+        CNI_WEIGHT_URL.format(code=code), headers=CNI_HEADERS, timeout=30)
+    tmp_path = os.path.join(tempfile.gettempdir(), f"cni_sample_{code}.xls")
+    with open(tmp_path, "wb") as handle:
+        handle.write(response.content)
+
+    frame = pd.read_excel(tmp_path, header=0)
+    columns = list(frame.columns)
+    col_code = next(c for c in columns if "样本代码" in c)
+    col_weight = next(c for c in columns if "权重" in c)
+    col_name = next(c for c in columns if "样本简称" in c)
+    col_date = next(c for c in columns if "日期" in c)
+
+    rows = []
+    for _, row in frame.iterrows():
+        raw_code = str(row[col_code]).split(".")[0].strip().zfill(6)
+        weight = _to_positive_float(row[col_weight])
+        if not raw_code.strip("0") or weight is None:
+            continue
+        rows.append((_guess_market(raw_code) + raw_code, str(row[col_name]), weight))
+    return rows, _normalize_date(str(frame.iloc[0][col_date]))
+
+
+def fetch_stock_quotes(symbols, batch_size=50):
+    """批量抓取个股行情（腾讯），返回 {symbol: 字段列表}。"""
+    quotes = {}
+    for start in range(0, len(symbols), batch_size):
+        batch = symbols[start:start + batch_size]
+        response = _request_with_retry(
+            TENCENT_QUOTE_URL.format(symbols=",".join(batch)),
+            headers=TENCENT_HEADERS, timeout=25)
+        response.encoding = "gbk"
+        for line in response.text.strip().split("\n"):
+            matched = re.match(r'v_([a-z]{2}\d{6})="', line)
+            if not matched:
+                continue
+            fields = line.split('="', 1)[1].rsplit('"', 1)[0].split("~")
+            if len(fields) > TENCENT_FIELD_DY:
+                quotes[matched.group(1)] = fields
+        time.sleep(0.3)
+    return quotes
+
+
+def build_valuation_block(code, source="CSI"):
+    """按成分股权重加权计算指数的 PE-TTM / PB / 加权股息率。
+
+    股息率是市值的线性函数，用算术加权；
+    PE / PB 是「总量之比」，必须用调和加权 1/Σ(w/值)，否则会系统性高估。
+    """
+    rows, weight_date = (
+        fetch_cni_weights(code) if source == "CNI" else fetch_csi_weights(code)
+    )
+    quotes = fetch_stock_quotes([symbol for symbol, _, _ in rows])
+
+    total_weight = 0.0
+    sum_dividend = 0.0
+    inv_pe = 0.0
+    inv_pb = 0.0
+    valid = 0
+    quote_dates = []
+    for symbol, _name, weight in rows:
+        fields = quotes.get(symbol)
+        if not fields:
+            continue
+        # 记录行情所属交易日（各成分股取最新），即估值数据的实际日期
+        raw_time = fields[TENCENT_FIELD_TIME] if len(fields) > TENCENT_FIELD_TIME else ""
+        if len(raw_time) >= 8 and raw_time[:8].isdigit():
+            quote_dates.append(raw_time[:8])
+        pe = _to_positive_float(fields[TENCENT_FIELD_PE])
+        pb = _to_positive_float(fields[TENCENT_FIELD_PB])
+        dividend = _to_positive_float(fields[TENCENT_FIELD_DY])
+        if pe is None or pb is None or dividend is None:
+            continue
+        total_weight += weight
+        sum_dividend += weight * dividend
+        inv_pe += weight / pe
+        inv_pb += weight / pb
+        valid += 1
+
+    if not total_weight:
+        return {}
+
+    return {
+        "pe_ttm": round(total_weight / inv_pe, 2) if inv_pe else None,
+        "pb": round(total_weight / inv_pb, 2) if inv_pb else None,
+        "dividend_yield": round(sum_dividend / total_weight, 2),
+        "weight_date": weight_date,
+        # 个股行情所属交易日：估值数据本身的日期
+        "data_date": _normalize_date(max(quote_dates)) if quote_dates else weight_date,
+        "source": "中证指数官网" if source == "CSI" else "国证指数官网",
+        "component_count": len(rows),
+        "valid_count": valid,
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def fetch_index_valuations():
+    """计算全部已配置指数的估值数据，返回 {指数名: block}。"""
+    result = {}
+    for name, (code, source) in VALUATION_CONFIG.items():
+        try:
+            block = build_valuation_block(code, source)
+        except Exception as e:  # 第三方文件结构变化不应中断整体更新
+            print(f"⚠️ {name} 估值数据计算失败: {e}")
+            continue
+        if block:
+            result[name] = block
+            print(
+                f"{name} 估值：PE-TTM {block['pe_ttm']}｜PB {block['pb']}"
+                f"｜加权股息率 {block['dividend_yield']}%"
+                f"（权重日 {block['weight_date']}，"
+                f"{block['valid_count']}/{block['component_count']} 只有效）"
+            )
+    return result
+
+
 def update_html(file_path):
     print(f"正在处理文件: {file_path}")
     if not os.path.exists(file_path): return
@@ -659,6 +876,23 @@ def update_html(file_path):
                     else ""
                 )
                 print(f"{name} 跟踪数据已同步（{len(hit)} 个阶段 / {len(tracking['years'])} 个年度）{extra}")
+
+    # 指数估值（成分股权重加权）：PE-TTM / PB / 加权股息率
+    for name, block in fetch_index_valuations().items():
+        if name not in all_data:
+            continue
+        previous_valuation = all_data[name].get("valuation") or {}
+        # 只比较实质字段，忽略每次都会变的 updated_at，避免无意义的提交
+        if (
+            previous_valuation.get("pe_ttm") != block["pe_ttm"]
+            or previous_valuation.get("pb") != block["pb"]
+            or previous_valuation.get("dividend_yield") != block["dividend_yield"]
+            or previous_valuation.get("weight_date") != block["weight_date"]
+            or previous_valuation.get("source") != block["source"]
+            or previous_valuation.get("data_date") != block["data_date"]
+        ):
+            all_data[name]["valuation"] = block
+            updated_any = True
 
     if updated_any:
         new_json = json.dumps(all_data, ensure_ascii=False)
